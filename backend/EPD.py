@@ -202,6 +202,13 @@ def home():
         'message': 'API is working'
     })
 
+@app.route('/api/test')
+def test_connection():
+    return jsonify({
+        'status': 'ok',
+        'message': 'Server is running'
+    })
+
 @app.route('/api/email/complete-analysis')
 def complete_analysis():
     try:

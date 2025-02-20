@@ -15,11 +15,11 @@ const App = () => {
               } } />
         <Box flex="1">
           <Routes>
+            <Route path="/" element={<EmailDashboard />} />
             <Route path="/emails" element={<EmailDashboard />} />
             <Route path="/link-analysis" element={<LinkAnalysis />} />
             <Route path="/threats" element={<Threats />} />
             <Route path="/settings" element={<Settings />} />
-            <Route path="/" element={<EmailDashboard />} />
           </Routes>
         </Box>
       </Box>
