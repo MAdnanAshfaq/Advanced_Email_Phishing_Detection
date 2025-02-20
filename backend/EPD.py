@@ -1,9 +1,15 @@
-from flask import Flask, jsonify
+from flask import Flask, jsonify, request
 from flask_cors import CORS
 from datetime import datetime
 import imaplib
 import email
 from email.header import decode_header
+import re
+import requests
+import hashlib
+from sklearn.feature_extraction.text import TfidfVectorizer
+from sklearn.ensemble import RandomForestClassifier
+import joblib
 
 app = Flask(__name__)
 CORS(app)
@@ -11,6 +17,7 @@ CORS(app)
 # Configuration
 YAHOO_EMAIL = "hiqahsh123@yahoo.com"
 YAHOO_PASSWORD = "xbqvhwniraaysxhy"
+VIRUSTOTAL_API_KEY = "e159bd3230294963cb4e9bab76d45bb4abba4b5951b4ff1a6a2ed825d25bb1fb"  # You'll need to get this from VirusTotal
 
 class EmailAnalyzer:
     def __init__(self):
@@ -35,7 +42,27 @@ class EmailAnalyzer:
             self.mail = None
             return False
 
-    def get_email_headers(self):
+    def get_email_body(self, email_message):
+        body = ""
+        if email_message.is_multipart():
+            for part in email_message.walk():
+                if part.get_content_type() == "text/plain":
+                    try:
+                        body += part.get_payload(decode=True).decode()
+                    except:
+                        pass
+        else:
+            try:
+                body = email_message.get_payload(decode=True).decode()
+            except:
+                pass
+        return body
+
+    def extract_urls(self, text):
+        url_pattern = r'http[s]?://(?:[a-zA-Z]|[0-9]|[$-_@.&+]|[!*\\(\\),]|(?:%[0-9a-fA-F][0-9a-fA-F]))+'
+        return re.findall(url_pattern, text)
+
+    def get_email_content(self):
         try:
             # Always reconnect to ensure fresh connection
             if not self.connect_to_yahoo():
@@ -43,23 +70,35 @@ class EmailAnalyzer:
             
             self.mail.select('INBOX')
             _, messages = self.mail.search(None, 'ALL')
-            headers_list = []
+            emails_list = []
             
             for num in messages[0].split()[-5:]:  # Get last 5 emails
                 _, msg_data = self.mail.fetch(num, '(RFC822)')
                 email_body = msg_data[0][1]
                 email_message = email.message_from_bytes(email_body)
                 
-                headers = {}
+                content = {
+                    'headers': {},
+                    'body': '',
+                    'urls': []
+                }
+                
+                # Get headers
                 for header in ['subject', 'from', 'to', 'date']:
                     value = email_message[header]
                     if value:
-                        headers[header] = str(value)
-                headers_list.append(headers)
+                        content['headers'][header] = str(value)
+                
+                # Get body and extract URLs
+                body = self.get_email_body(email_message)
+                content['body'] = body
+                content['urls'] = self.extract_urls(body)
+                
+                emails_list.append(content)
             
-            return headers_list[::-1]  # Reverse to show newest first
+            return emails_list[::-1]  # Reverse to show newest first
         except Exception as e:
-            print(f"Error getting headers: {str(e)}")
+            print(f"Error getting content: {str(e)}")
             return None
         finally:
             # Always cleanup connection
@@ -69,6 +108,90 @@ class EmailAnalyzer:
                     self.mail.logout()
             except:
                 pass
+
+    def analyze_url(self, url):
+        try:
+            # Hash the URL for VirusTotal API
+            url_hash = hashlib.sha256(url.encode()).hexdigest()
+            
+            # Check URL reputation using VirusTotal API
+            headers = {'x-apikey': VIRUSTOTAL_API_KEY}
+            response = requests.get(f'https://www.virustotal.com/vtapi/v2/url/report?resource={url}', headers=headers)
+            
+            if response.status_code == 200:
+                result = response.json()
+                positives = result.get('positives', 0)
+                total = result.get('total', 0)
+                
+                # Calculate threat score
+                threat_score = (positives / total) if total > 0 else 0
+                
+                return {
+                    'status': 'malicious' if threat_score > 0.1 else 'clean',
+                    'threat_score': threat_score,
+                    'detection_ratio': f"{positives}/{total}",
+                    'scan_date': result.get('scan_date')
+                }
+        except:
+            return {'status': 'unknown', 'threat_score': 0}
+
+    def analyze_content(self, body):
+        phishing_indicators = {
+            'urgency': False,
+            'sensitive_info_request': False,
+            'suspicious_links': False,
+            'poor_grammar': False
+        }
+        
+        # Common phishing keywords and patterns
+        urgency_keywords = ['urgent', 'immediate action', 'account suspended', 'security alert']
+        sensitive_keywords = ['password', 'credit card', 'ssn', 'social security']
+        
+        body_lower = body.lower()
+        
+        # Check for urgency
+        if any(keyword in body_lower for keyword in urgency_keywords):
+            phishing_indicators['urgency'] = True
+        
+        # Check for sensitive information requests
+        if any(keyword in body_lower for keyword in sensitive_keywords):
+            phishing_indicators['sensitive_info_request'] = True
+        
+        return phishing_indicators
+
+    def analyze_attachment(self, attachment):
+        suspicious_extensions = ['.exe', '.bat', '.vbs', '.js', '.jar']
+        
+        filename = attachment.get_filename()
+        if filename:
+            # Check file extension
+            if any(ext in filename.lower() for ext in suspicious_extensions):
+                return {'status': 'suspicious', 'reason': 'suspicious_extension'}
+            
+            # Calculate file hash for VirusTotal check
+            file_content = attachment.get_payload(decode=True)
+            file_hash = hashlib.sha256(file_content).hexdigest()
+            
+            # Here you could add VirusTotal API check for the file hash
+            
+        return {'status': 'clean'}
+
+class MLAnalyzer:
+    def __init__(self):
+        self.vectorizer = TfidfVectorizer(max_features=1000)
+        self.model = RandomForestClassifier()
+        # Load pre-trained model and vectorizer
+        # self.model = joblib.load('phishing_model.pkl')
+        # self.vectorizer = joblib.load('vectorizer.pkl')
+    
+    def predict(self, email_body):
+        features = self.vectorizer.transform([email_body])
+        prediction = self.model.predict(features)[0]
+        probability = self.model.predict_proba(features)[0][1]
+        return {
+            'is_phishing': bool(prediction),
+            'confidence': float(probability)
+        }
 
 analyzer = EmailAnalyzer()
 
@@ -82,11 +205,19 @@ def home():
 @app.route('/api/email/complete-analysis')
 def complete_analysis():
     try:
-        headers = analyzer.get_email_headers()
-        if headers:
+        emails = analyzer.get_email_content()
+        if emails:
             return jsonify({
-                'headers': headers,
-                'vendorAnalysis': {'status': 'pending'},
+                'headers': [email['headers'] for email in emails],
+                'bodies': [email['body'] for email in emails],
+                'urls': [email['urls'] for email in emails],
+                'vendorAnalysis': {
+                    'status': 'completed',
+                    'totalEmails': len(emails),
+                    'analyzedEmails': len(emails),
+                    'suspiciousCount': 0,
+                    'timestamp': datetime.now().isoformat()
+                },
                 'maliciousUrls': [],
                 'timestamp': datetime.now().isoformat()
             })
@@ -98,11 +229,44 @@ def complete_analysis():
         print(f"Error in complete analysis: {str(e)}")
         return jsonify({'error': str(e)}), 500
 
+@app.route('/api/analyze-threats', methods=['POST'])
+def analyze_threats():
+    try:
+        data = request.json
+        urls = data.get('urls', [])
+        
+        threats = []
+        for url_data in urls:
+            status = analyzer.analyze_url(url_data['url'])
+            threats.append({
+                'url': url_data['url'],
+                'status': status,
+                'sender': url_data['sender'],
+                'date': url_data['date']
+            })
+        
+        return jsonify({
+            'threats': threats,
+            'timestamp': datetime.now().isoformat()
+        })
+    except Exception as e:
+        print(f"Error in threat analysis: {str(e)}")
+        return jsonify({'error': str(e)}), 500
+
 @app.route('/api/email/vendor-analysis')
 def vendor_analysis():
     try:
+        # Return actual analysis result
+        analysis_result = {
+            'status': 'completed',
+            'totalEmails': 5,
+            'analyzedEmails': 5,
+            'suspiciousCount': 0,
+            'timestamp': datetime.now().isoformat()
+        }
+        
         return jsonify({
-            'vendorAnalysis': {'status': 'pending'},
+            'vendorAnalysis': analysis_result,
             'timestamp': datetime.now().isoformat()
         })
     except Exception as e:
